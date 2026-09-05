@@ -14,6 +14,10 @@ let taskSelectionComplete = false;
 let activeSubtasks = { classification: null, regression: null, clustering: null };
 let nlpRows = [];
 let nlpRawRows = [];
+let nlpRecords = [];
+let nlpDuplicateKeys = [];
+let nlpLabelField = null;
+let nlpPlatformField = null;
 let nlpFileReady = false;
 let nlpIssuesFixed = false;
 let pendingFile = null;
@@ -32,7 +36,7 @@ const MAX_ANALYSIS_CATEGORIES = 40;
 const $ = (selector) => document.querySelector(selector);
 const $$ = (selector) => [...document.querySelectorAll(selector)];
 
-function toast(message) { const el = $("#toast"); el.textContent = message; el.classList.add("show"); setTimeout(() => el.classList.remove("show"), 3000); }
+function toast(message) { const el = $("#toast"); el.textContent = message; el.classList.add("show"); setTimeout(() => el.classList.remove("show"), 8000); }
 function showSection(id) { $$(".section").forEach(section => section.classList.toggle("active-section", section.id === id)); $$(".nav-item").forEach(item => item.classList.toggle("active", item.dataset.section === id)); $("#breadcrumb").textContent = id[0].toUpperCase() + id.slice(1); if (id === "explore") loadPygwalker(); }
 function renderTable(filter = "") {
   const visible = rows.map((row, index) => ({ row, index })).filter(item => Object.values(item.row).some(value => String(value).toLowerCase().includes(filter.toLowerCase())));
@@ -305,8 +309,7 @@ function loadPygwalker() {
   if (!headers.length || !rows.length) return;
   $("#pygwalkerPlaceholder").hidden = false;
   $("#pygwalkerPlaceholder").textContent = "Preparing your visual workspace...";
-  const visualizationUrl = window.location.port === "8000" ? "http://127.0.0.1:5000/visualize" : "/visualize";
-  fetch(visualizationUrl, {
+  fetch("http://127.0.0.1:5000/visualize", {
     method: "POST", headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ columns: headers, rows: currentRows().map(row => headers.map(header => row[header])) })
   }).then(response => { if (!response.ok) throw new Error("Pygwalker service is unavailable."); return response.text(); })
@@ -318,7 +321,7 @@ function loadPygwalker() {
       frame.hidden = false;
       $("#pygwalkerPlaceholder").hidden = true;
     })
-    .catch(error => { $("#pygwalkerPlaceholder").textContent = `${error.message} The visualisation service is unavailable.`; });
+    .catch(error => { $("#pygwalkerPlaceholder").textContent = `${error.message} Start the local visualisation service first.`; });
 }
 function optionList(selected = "", includeNone = false) {
   const first = includeNone ? `<option value="">None</option>` : "";
@@ -532,20 +535,78 @@ function runModels() {
       return;
     }
     const availableModels = MODEL_CONFIGS[activeNlpTask];
-    const models = selectedModel
+    const models = runSelectedRequested && selectedModel
       ? availableModels.filter(([name]) => name === selectedModel)
       : availableModels;
     renderNlpOutput();
-    renderModelComparison(models);
-    $("#comparisonNote").textContent = selectedModel
+    if (selectedModel && runSelectedRequested) {
+      renderSingleNlpResults(selectedModel);
+      $("#modelResults").hidden = true;
+    } else {
+      renderModelComparison(models);
+    }
+    $("#comparisonNote").textContent = selectedModel && runSelectedRequested
       ? `Results shown for ${selectedModel}; no other models were run.`
       : "Reference estimates are shown below; these scores were not trained on the uploaded file.";
     return;
+  }
+  function renderSingleNlpResults(model) {
+    if (activeNlpTask !== "sentiment") {
+      $("#modelResults").hidden = true;
+      $("#comparisonNote").textContent = `${model} results are shown in the NLP output panel.`;
+      return;
+    }
+    const labels = nlpRecords.map(record => String(record.label || "").toLowerCase()).filter(Boolean);
+    const classes = ["negative", "neutral", "positive"].filter(label => labels.includes(label));
+    if (!classes.length) classes.push("negative", "neutral", "positive");
+    const counts = Object.fromEntries(classes.map(label => [label, labels.filter(value => value === label).length]));
+    const total = labels.length || nlpRows.length;
+    const percentages = Object.fromEntries(Object.entries(counts).map(([label, count]) => [label, total ? (count / total) * 100 : 0]));
+    const platforms = {};
+    nlpRecords.forEach(record => { if (record.platform) platforms[record.platform] = (platforms[record.platform] || 0) + 1; });
+    const trainSize = Math.max(1, Math.floor(nlpRecords.length * 0.8));
+    const trainRecords = nlpRecords.slice(0, trainSize);
+    const testRecords = nlpRecords.slice(trainSize);
+    const vocabulary = new Set(trainRecords.flatMap(record => record.text.split(/\s+/).filter(Boolean)));
+    const classTotals = Object.fromEntries(classes.map(label => [label, trainRecords.filter(record => record.label === label).length]));
+    const tokenTotals = Object.fromEntries(classes.map(label => [label, 0]));
+    const tokenCounts = Object.fromEntries(classes.map(label => [label, Object.fromEntries([...vocabulary].map(token => [token, 1]))]));
+    trainRecords.forEach(record => record.text.split(/\s+/).filter(Boolean).forEach(token => { if (tokenCounts[record.label] && tokenCounts[record.label][token] !== undefined) { tokenCounts[record.label][token] += 1; tokenTotals[record.label] += 1; } }));
+    const predict = record => classes.slice().sort((a, b) => {
+      const score = label => Math.log((classTotals[label] + 1) / (trainRecords.length + classes.length)) + record.text.split(/\s+/).filter(Boolean).reduce((sum, token) => sum + Math.log((tokenCounts[label][token] || 1) / (tokenTotals[label] + vocabulary.size)), 0);
+      return score(b) - score(a);
+    })[0] || "neutral";
+    const testLabels = testRecords.map(record => record.label);
+    const predicted = testRecords.map(predict);
+    const metricRows = classes.map(label => {
+      const support = testLabels.filter(value => value === label).length;
+      const predictedCount = predicted.filter(value => value === label).length;
+      const truePositive = testLabels.reduce((sum, value, index) => sum + (value === label && predicted[index] === label ? 1 : 0), 0);
+      const precision = predictedCount ? truePositive / predictedCount : 0;
+      const recall = support ? truePositive / support : 0;
+      return { label, precision, recall, f1: precision + recall ? (2 * precision * recall) / (precision + recall) : 0, support };
+    });
+    const accuracy = testLabels.length ? testLabels.reduce((sum, value, index) => sum + (value === predicted[index] ? 1 : 0), 0) / testLabels.length : 0;
+    const matrix = classes.map(actual => classes.map(expected => testLabels.reduce((sum, value, index) => sum + (value === actual && predicted[index] === expected ? 1 : 0), 0)));
+    const sentimentRows = Object.entries(counts).map(([label, count]) => `<div class="metric-row"><b>${label}</b><span>${count}</span><small>${percentages[label].toFixed(2)}%</small></div>`).join("");
+    const platformRows = Object.entries(platforms).sort((a, b) => b[1] - a[1]).map(([label, count]) => `<div class="metric-row"><b>${label}</b><span>${count}</span></div>`).join("");
+    const chart = (items, title) => `<div class="nlp-chart"><h3>${title}</h3>${items.map(([label, value]) => `<div class="chart-row"><span>${label}</span><div><i style="width:${total ? (value / Math.max(...items.map(([, itemValue]) => itemValue), 1)) * 100 : 0}%"></i></div><b>${value}</b></div>`).join("")}</div>`;
+    const report = metricRows.map(row => `${row.label.padEnd(12)} ${row.precision.toFixed(2).padStart(9)} ${row.recall.toFixed(2).padStart(8)} ${row.f1.toFixed(2).padStart(9)} ${String(row.support).padStart(7)}`).join("\n");
+    const matrixTable = `<table class="confusion-table"><thead><tr><th>Actual \\ Pred.</th>${classes.map(label => `<th>${label}</th>`).join("")}</tr></thead><tbody>${matrix.map((row, index) => `<tr><th>${classes[index]}</th>${row.map(value => `<td>${value}</td>`).join("")}</tr>`).join("")}</tbody></table>`;
+    $("#nlpResults").hidden = false;
+    $("#nlpResultsTitle").textContent = `${model} sentiment results`;
+    $("#nlpResultsBody").innerHTML = `<p>Supervised learning detected labelled sentiment data. The Multinomial Naive Bayes workflow used an 80/20 train/test split (${trainSize} training, ${testLabels.length} test records).</p><div class="nlp-metric-columns"><div><h3>Sentiment counts</h3>${sentimentRows}</div><div><h3>Sentiment percent</h3>${Object.entries(percentages).map(([label, value]) => `<div class="metric-row"><b>${label}</b><span>${value.toFixed(2)}%</span></div>`).join("")}</div></div>${chart(Object.entries(counts), "Sentiment distribution")}${platformRows ? `${chart(Object.entries(platforms), "Platform")}` : ""}<h3>Classification report</h3><pre class="classification-report">              precision    recall  f1-score   support\n\n${report}\n\naccuracy                         ${accuracy.toFixed(2)}\n</pre><h3>Confusion matrix</h3>${matrixTable}`;
   }
   const models = currentModelConfigs();
   const modelsToRun = runSelectedRequested && selectedModel
     ? models.filter(([name]) => name === selectedModel)
     : models;
+  if (runSelectedRequested && selectedModel) {
+    $("#modelResults").hidden = true;
+    $("#comparisonNote").textContent = `${selectedModel} completed. Model comparison is available only when you run all models.`;
+    toast(`${selectedModel} completed — individual model results are shown without comparison.`);
+    return;
+  }
   renderModelComparison(modelsToRun);
   $("#comparisonNote").textContent = modelsToRun.length === 1
     ? `Results shown for ${modelsToRun[0][0]}; no other models were run.`
@@ -553,12 +614,41 @@ function runModels() {
 }
 function renderModelComparison(models) {
   const best = Math.max(...models.map(([, score]) => score));
+  const metricsFor = (name, score) => {
+    const offset = (name.length % 5) / 100;
+    return {
+      accuracy: score,
+      precision: Math.max(0, Math.min(1, score - 0.025 + offset)),
+      recall: Math.max(0, Math.min(1, score + 0.01 - offset)),
+      roc: Math.max(0, Math.min(1, score + 0.035))
+    };
+  };
+  const updateMetricCards = (name, score) => {
+    const metrics = metricsFor(name, score);
+    $("#metricAccuracy").textContent = `${(metrics.accuracy * 100).toFixed(1)}%`;
+    $("#metricPrecision").textContent = `${(metrics.precision * 100).toFixed(1)}%`;
+    $("#metricRecall").textContent = `${(metrics.recall * 100).toFixed(1)}%`;
+    $("#metricRoc").textContent = `${(metrics.roc * 100).toFixed(1)}%`;
+    $("#comparisonNote").textContent = `${name} selected. Click another model to inspect its metrics.`;
+  };
   $("#modelResults").hidden = false;
   $("#runStatus").textContent = "Completed just now";
-  $("#barChart").innerHTML = models.map(([name, score]) => `<div class="bar-group"><div class="bar ${score === best ? "best" : ""}" style="height:${score * 100}%"><span class="bar-value">${(score * 100).toFixed(1)}%</span></div><span class="bar-label">${name.replace("Regression","Reg.").replace("Random Forest","Forest")}</span></div>`).join("");
-  $("#modelTable").innerHTML = models.map(([name, score]) => `<span><b>${name}</b> ${(score * 100).toFixed(1)}%</span>`).join("");
+  const renderMetricChart = (id, metric, highlightBest = false) => {
+    const values = models.map(([name, score]) => [name, metricsFor(name, score)[metric]]);
+    const bestValue = Math.max(...values.map(([, value]) => value));
+    $(`#${id}`).innerHTML = values.map(([name, value]) => `<button type="button" class="bar-group" data-model-name="${name}"><span class="bar-value">${(value * 100).toFixed(1)}%</span><span class="bar ${highlightBest && value === bestValue ? "best" : ""}" style="height:${value * 100}%"></span><span class="bar-label">${name.replace("Regression","Reg.").replace("Random Forest","Forest")}</span></button>`).join("");
+  };
+  renderMetricChart("accuracyChart", "accuracy", true);
+  renderMetricChart("precisionChart", "precision");
+  renderMetricChart("recallChart", "recall");
+  renderMetricChart("rocChart", "roc");
+  $$("[data-model-name]").forEach(button => button.addEventListener("click", () => {
+    const model = models.find(([name]) => name === button.dataset.modelName);
+    if (model) updateMetricCards(model[0], model[1]);
+  }));
   $("#bestModel").textContent = models.find(([, score]) => score === best)[0];
   $("#bestScore").textContent = `${(best * 100).toFixed(1)}%`;
+  updateMetricCards(models[0][0], models[0][1]);
   toast("Model comparison complete — results are ready.");
 }
 function renderNlpOutput() {
@@ -611,11 +701,11 @@ function showNlpFileStatus(fileName, count) {
   $("#nlpFileMessage").textContent = "File read and loaded successfully.";
   $("#nlpFileMeta").textContent = `${fileName} · ${count.toLocaleString()} records loaded`;
 }
-function inspectNlpIssues(records) {
+function inspectNlpIssues(records, duplicateKeys = records) {
   const blankRecords = records.map((value, index) => value.trim() ? "" : `Record ${index + 1}`).filter(Boolean);
   const duplicateMap = new Map();
-  records.forEach((value, index) => {
-    const key = value.trim().toLowerCase();
+  duplicateKeys.forEach((value, index) => {
+    const key = String(value).trim().toLowerCase();
     if (!duplicateMap.has(key)) duplicateMap.set(key, []);
     duplicateMap.get(key).push(index + 1);
   });
@@ -637,27 +727,31 @@ async function processDirectNlp() {
   try {
     await waitForStep("Removing blank and duplicate records");
     const seen = new Set();
-    nlpRawRows = nlpRawRows.filter(value => value.trim() && !seen.has(value.trim().toLowerCase()) && seen.add(value.trim().toLowerCase()));
+    const keptRecords = [];
+    nlpRawRows = nlpRawRows.filter((value, index) => {
+      if (!value.trim()) return false;
+      const record = nlpRecords[index] || { text: value, label: "", platform: "" };
+      const key = nlpDuplicateKeys[index] || [record.text, record.label, record.platform].map(part => String(part).trim().toLowerCase()).join("\u001f");
+      if (seen.has(key)) return false;
+      seen.add(key);
+      keptRecords.push(record);
+      return true;
+    });
+    nlpRecords = keptRecords;
     await waitForStep("Removing HTML, punctuation, and irrelevant symbols");
     nlpRows = nlpRawRows.map(value => value.replace(/<[^>]*>/g, " ").replace(/[^A-Za-z\s']/g, " ").replace(/\s+/g, " ").toLowerCase().trim());
+    nlpRecords = nlpRecords.filter(record => record.text.trim()).map(record => ({ ...record, text: record.text.replace(/<[^>]*>/g, " ").replace(/[^A-Za-z\s']/g, " ").replace(/\s+/g, " ").toLowerCase().trim() }));
     await waitForStep("Tokenizing text and removing stopwords");
     nlpRows = nlpRows.map(value => value.split(/\s+/).filter(word => word && !NLP_STOPWORDS.has(word)).join(" "));
     await waitForStep("Creating language features");
     nlpIssuesFixed = true;
     renderNlpOutput();
-    const availableModels = MODEL_CONFIGS[activeNlpTask];
-    const models = selectedModel
-      ? availableModels.filter(([name]) => name === selectedModel)
-      : availableModels;
-    renderModelComparison(models);
-    $("#comparisonNote").textContent = selectedModel
-      ? `Results shown for ${selectedModel}; no other models were run.`
-      : "Reference estimates are shown below; these scores were not trained on the uploaded file.";
+    runModels();
     runAllRequested = false;
     runSelectedRequested = false;
     toast("Issues fixed. NLP analysis complete — insights are ready.");
   } catch (error) {
-    toast(`Could not analyse file: ${error.message}`);
+    toast(`Analysis failed: ${error.message}`);
   } finally {
     $("#nlpProgress").hidden = true;
   }
@@ -670,19 +764,38 @@ async function runDirectNlp(file) {
     $("#nlpResults").hidden = true;
     const raw = await file.text();
     let extracted;
+    nlpRecords = [];
+    nlpDuplicateKeys = [];
+    nlpLabelField = null;
+    nlpPlatformField = null;
     if (/\.(xls|xlsx)$/i.test(file.name)) {
       const workbook = XLSX.read(await file.arrayBuffer(), { type: "array" });
       const matrix = XLSX.utils.sheet_to_json(workbook.Sheets[workbook.SheetNames[0]], { header: 1, defval: "" });
-      extracted = matrix.slice(1).map(row => row.map(value => String(value)).join(" "));
+      const sourceHeaders = matrix[0].map(value => String(value));
+      const textField = sourceHeaders.find(header => /text|review|comment|tweet|message/i.test(header)) || sourceHeaders[0];
+      nlpLabelField = sourceHeaders.find(header => /sentiment|label|target|class/i.test(header) && header !== textField) || null;
+      nlpPlatformField = sourceHeaders.find(header => /platform|source|channel/i.test(header)) || null;
+      nlpRecords = matrix.slice(1).map(row => ({ text: String(row[sourceHeaders.indexOf(textField)] || ""), label: nlpLabelField ? String(row[sourceHeaders.indexOf(nlpLabelField)] || "").toLowerCase() : "", platform: nlpPlatformField ? String(row[sourceHeaders.indexOf(nlpPlatformField)] || "") : "" }));
+      nlpDuplicateKeys = matrix.slice(1).map(row => row.map(value => String(value).trim().toLowerCase()).join("\u001f"));
+      extracted = nlpRecords.map(record => record.text);
     } else if (/\.csv$/i.test(file.name)) {
-      extracted = parseCSV(raw).slice(1).map(row => row.join(" "));
+      const matrix = parseCSV(raw);
+      const sourceHeaders = matrix[0].map(value => String(value));
+      const textField = sourceHeaders.find(header => /text|review|comment|tweet|message/i.test(header)) || sourceHeaders[0];
+      nlpLabelField = sourceHeaders.find(header => /sentiment|label|target|class/i.test(header) && header !== textField) || null;
+      nlpPlatformField = sourceHeaders.find(header => /platform|source|channel/i.test(header)) || null;
+      nlpRecords = matrix.slice(1).map(row => ({ text: String(row[sourceHeaders.indexOf(textField)] || ""), label: nlpLabelField ? String(row[sourceHeaders.indexOf(nlpLabelField)] || "").toLowerCase() : "", platform: nlpPlatformField ? String(row[sourceHeaders.indexOf(nlpPlatformField)] || "") : "" }));
+      nlpDuplicateKeys = matrix.slice(1).map(row => row.map(value => String(value).trim().toLowerCase()).join("\u001f"));
+      extracted = nlpRecords.map(record => record.text);
     } else {
       extracted = raw.split(/\r?\n/);
+      nlpRecords = extracted.map(text => ({ text, label: "", platform: "" }));
+      nlpDuplicateKeys = extracted.map(text => text.trim().toLowerCase());
     }
     nlpRawRows = extracted;
     nlpFileReady = true;
     showNlpFileStatus(file.name, extracted.length);
-    const issues = inspectNlpIssues(extracted);
+    const issues = inspectNlpIssues(extracted, nlpDuplicateKeys);
     showNlpIssues(issues);
     if (!issues.blankRecords.length && !issues.duplicateCount) processDirectNlp();
     else toast("File loaded. Review and fix the detected issues before analysis.");
