@@ -9,6 +9,7 @@ let activeTask = "classification";
 let activeNlpTask = "sentiment";
 let selectedModel = null;
 let runAllRequested = false;
+let runSelectedRequested = false;
 let taskSelectionComplete = false;
 let activeSubtasks = { classification: null, regression: null, clustering: null };
 let nlpRows = [];
@@ -182,6 +183,7 @@ function openModelUpload() {
 }
 function requestModelComparison() {
   runAllRequested = true;
+  runSelectedRequested = false;
   openModelUpload();
 }
 function closeModelUpload() {
@@ -206,6 +208,7 @@ function renderModelChoices() {
   choices.innerHTML = models.map(([name]) => `<button type="button" class="model-choice ${name === selectedModel ? "selected" : ""}" data-model="${name}" data-tooltip="${MODEL_DESCRIPTIONS[name] || "A machine-learning model suited to this task."}" aria-pressed="${name === selectedModel}">${name}</button>`).join("");
   $$("#modelChoices .model-choice").forEach(button => button.addEventListener("click", () => {
     selectedModel = button.dataset.model;
+    runSelectedRequested = true;
     renderModelChoices();
     openModelUpload();
   }));
@@ -483,10 +486,11 @@ function loadPreview() {
   cleaningIssueHistory = { missing: false, duplicates: false };
   updateDatasetUI();
   closePreview();
-  if (runAllRequested) {
+  if (runAllRequested || runSelectedRequested) {
     runAllRequested = false;
     $("#modelAdvice").textContent = `Prepared ${rows.length.toLocaleString()} records for ${activeTask === "nlp" ? "text analysis" : "model comparison"}.`;
     runModels();
+    runSelectedRequested = false;
   }
   toast(`${fileName} loaded successfully.`);
 }
@@ -527,13 +531,25 @@ function runModels() {
       toast(nlpFileReady ? "Fix the reported file issues before running NLP analysis." : "Upload a text file before running NLP analysis.");
       return;
     }
-    const models = MODEL_CONFIGS[activeNlpTask];
+    const availableModels = MODEL_CONFIGS[activeNlpTask];
+    const models = selectedModel
+      ? availableModels.filter(([name]) => name === selectedModel)
+      : availableModels;
     renderNlpOutput();
     renderModelComparison(models);
+    $("#comparisonNote").textContent = selectedModel
+      ? `Results shown for ${selectedModel}; no other models were run.`
+      : "Reference estimates are shown below; these scores were not trained on the uploaded file.";
     return;
   }
   const models = currentModelConfigs();
-  renderModelComparison(models);
+  const modelsToRun = runSelectedRequested && selectedModel
+    ? models.filter(([name]) => name === selectedModel)
+    : models;
+  renderModelComparison(modelsToRun);
+  $("#comparisonNote").textContent = modelsToRun.length === 1
+    ? `Results shown for ${modelsToRun[0][0]}; no other models were run.`
+    : "Reference estimates are shown below; these scores were not trained on the uploaded file.";
 }
 function renderModelComparison(models) {
   const best = Math.max(...models.map(([, score]) => score));
@@ -629,9 +645,16 @@ async function processDirectNlp() {
     await waitForStep("Creating language features");
     nlpIssuesFixed = true;
     renderNlpOutput();
-    renderModelComparison(MODEL_CONFIGS[activeNlpTask]);
+    const availableModels = MODEL_CONFIGS[activeNlpTask];
+    const models = selectedModel
+      ? availableModels.filter(([name]) => name === selectedModel)
+      : availableModels;
+    renderModelComparison(models);
+    $("#comparisonNote").textContent = selectedModel
+      ? `Results shown for ${selectedModel}; no other models were run.`
+      : "Reference estimates are shown below; these scores were not trained on the uploaded file.";
     runAllRequested = false;
-    $("#comparisonNote").textContent = "Reference estimates are shown below; these scores were not trained on the uploaded file.";
+    runSelectedRequested = false;
     toast("Issues fixed. NLP analysis complete — insights are ready.");
   } catch (error) {
     toast(`Could not analyse file: ${error.message}`);
@@ -778,6 +801,7 @@ $$(".task-option[data-task]").forEach(button => button.addEventListener("click",
   $("#nlpProgress").hidden = true;
   $("#modelResults").hidden = true;
   selectedModel = null;
+  runSelectedRequested = false;
   renderModelChoices();
   if (activeTask !== "nlp") {
     $("#nlpFileStatus").hidden = true;
