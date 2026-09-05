@@ -1,0 +1,9 @@
+{
+  "name": "signalml",
+  "private": true,
+  "version": "0.1.0",
+  "description": "Explainable analytics workspace",
+  "dependencies": {
+    "xlsx": "^0.18.5"
+  }
+}
