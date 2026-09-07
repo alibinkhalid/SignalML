@@ -309,7 +309,10 @@ function loadPygwalker() {
   if (!headers.length || !rows.length) return;
   $("#pygwalkerPlaceholder").hidden = false;
   $("#pygwalkerPlaceholder").textContent = "Preparing your visual workspace...";
-  fetch("http://127.0.0.1:5000/visualize", {
+  const visualizationUrl = window.location.hostname === "localhost" || window.location.hostname === "127.0.0.1"
+    ? "http://127.0.0.1:5000/visualize"
+    : "/visualize";
+  fetch(visualizationUrl, {
     method: "POST", headers: { "Content-Type": "application/json" },
     body: JSON.stringify({ columns: headers, rows: currentRows().map(row => headers.map(header => row[header])) })
   }).then(response => { if (!response.ok) throw new Error("Pygwalker service is unavailable."); return response.text(); })
